@@ -14,6 +14,21 @@
 		(kids || []).forEach(function (c) { if (c) n.appendChild(typeof c === 'string' ? document.createTextNode(c) : c); });
 		return n;
 	}
+	/* A random key kept in this browser: only the browser that started a checkout may start over for the same email. */
+	var ckMemo = '';
+	function clientKey() {
+		if (ckMemo) return ckMemo;
+		var k = '';
+		try { k = window.localStorage.getItem('jmb_ck') || ''; } catch (e) {}
+		if (!/^[A-Za-z0-9]{32}$/.test(k)) {
+			var abc = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789', r = new Uint32Array(32);
+			window.crypto.getRandomValues(r);
+			k = '';
+			for (var i = 0; i < 32; i++) k += abc[r[i] % 62];
+			try { window.localStorage.setItem('jmb_ck', k); } catch (e) {}
+		}
+		return (ckMemo = k);
+	}
 	function pad(n) { return (n < 10 ? '0' : '') + n; }
 	function ym(y, m) { return y + '-' + pad(m + 1); }
 	function prettyDate(ymd) {
@@ -184,7 +199,7 @@
 			function turnstileToken() { return ts && window.turnstile && tsId !== null ? window.turnstile.getResponse(tsId) : ''; }
 
 			function collect() {
-				var body = { kind: s.kind, date: s.date, start: s.start, return_url: location.origin + location.pathname };
+				var body = { kind: s.kind, date: s.date, start: s.start, return_url: location.origin + location.pathname, client_key: clientKey() };
 				Array.prototype.forEach.call(f.elements, function (x) { if (x.name) body[x.name] = x.value.trim(); });
 				if ('location_pick' in body) {
 					body.location = body.location_pick === OTHER ? body.location_other : body.location_pick;

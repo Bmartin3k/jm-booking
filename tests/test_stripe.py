@@ -51,7 +51,7 @@ def webhook(event_type, session_id, booking_id, paid=True, secret=WHSEC, amount=
 
 def book(date, start, email, kind="full", xff="10.1.0.1", location="Mayfield Park", return_url="http://127.0.0.1:18080/book/"):
     return req("POST", "/book", {"kind": kind, "date": date, "start": start, "name": "Test " + email.split("@")[0],
-                                 "email": email, "location": location, "return_url": return_url}, xff=xff)
+                                 "email": email, "location": location, "return_url": return_url, "client_key": "S" * 32}, xff=xff)
 
 
 def ref_of(bid): return db(f"SELECT token FROM wp_jmb_bookings WHERE id={bid}")[0][0]

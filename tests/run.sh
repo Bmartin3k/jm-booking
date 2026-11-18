@@ -49,6 +49,7 @@ echo; echo "== Google Calendar";     reset_state; python3 test_gcal.py || status
 echo; echo "== Contracts";           reset_state; python3 test_contracts.py || status=1
 echo; echo "== Automatic emails";    reset_state; python3 test_emails.py || status=1
 echo; echo "== Balance payments";    reset_state; python3 test_balance.py || status=1
+echo; echo "== Security";            reset_state; python3 test_security.py || status=1
 
 if [ "${1:-}" = "--browser" ]; then
   echo; echo "== Browser pay flow"; reset_state

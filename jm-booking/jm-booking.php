@@ -2,15 +2,15 @@
 /**
  * Plugin Name: JM Session Booking
  * Description: Booking calendar: sunset-based weekend sessions, a cap on booked weekends per month, a discounted mini session that opens on booked days, school-year / summer weekday hours. Clients pay online with Stripe Checkout; paid bookings are sent to Sprout Studio through Zapier. Shortcode: [jm_booking]
- * Version: 2.5.0
+ * Version: 2.5.1
  * Requires PHP: 8.0
  * Requires at least: 6.4
  */
 
 if (!defined('ABSPATH')) exit;
 
-const JMB_VER    = '2.5.0';
-const JMB_DB_VER = '7';   // bump to re-run jmb_install() on update (table columns + cron events)
+const JMB_VER    = '2.5.1';
+const JMB_DB_VER = '8';   // bump to re-run jmb_install() on update (table columns + cron events)
 
 require_once __DIR__ . '/includes/contracts.php';
 require_once __DIR__ . '/includes/emails.php';
@@ -84,9 +84,17 @@ function jmb_defaults() {
 	];
 }
 
+/** Secrets that can be set in wp-config.php instead (then they are not in the database or its backups). */
+function jmb_secret_constants() {
+	return ['stripe_secret' => 'JMB_STRIPE_SECRET', 'stripe_webhook' => 'JMB_STRIPE_WEBHOOK', 'gcal_json' => 'JMB_GCAL_JSON',
+		'turnstile_secret' => 'JMB_TURNSTILE_SECRET', 'turnstile_site' => 'JMB_TURNSTILE_SITE'];
+}
+
 function jmb_settings() {
 	$s = get_option('jmb_settings', []);
-	return array_merge(jmb_defaults(), is_array($s) ? $s : []);
+	$s = array_merge(jmb_defaults(), is_array($s) ? $s : []);
+	foreach (jmb_secret_constants() as $k => $c) if (defined($c) && constant($c) !== '') $s[$k] = (string) constant($c);
+	return $s;
 }
 
 function jmb_tz() {
@@ -124,6 +132,7 @@ function jmb_install() {
 		stripe_session VARCHAR(255) NOT NULL DEFAULT '',
 		payment_id VARCHAR(255) NOT NULL DEFAULT '',
 		amount_cents INT UNSIGNED NOT NULL DEFAULT 0,
+		client_key CHAR(32) NOT NULL DEFAULT '',
 		PRIMARY KEY  (id),
 		KEY date_status (date, status),
 		KEY email (email),
@@ -790,13 +799,17 @@ function jmb_rest_book(WP_REST_Request $req) {
 	$t       = jmb_table();
 	$minutes = max(30, (int) $s['checkout_minutes']);
 	$token   = wp_generate_password(32, false);
+	$ckey    = preg_match('/^[A-Za-z0-9]{32}$/', (string) ($p['client_key'] ?? '')) ? $p['client_key'] : '';
 
 	if ((int) $wpdb->get_var("SELECT GET_LOCK('jmb_book', 10)") !== 1)
 		return new WP_Error('jmb_busy', 'Busy, please try again.', ['status' => 503]);
 	try {
-		// one unpaid checkout per email: starting a new one releases the old one
+		// One unpaid checkout per email. The same browser (client_key) may start over, which releases the old one;
+		// anyone else using that email has to wait, so a stranger cannot cancel someone's checkout in progress.
 		$old = $wpdb->get_results($wpdb->prepare(
-			"SELECT id, stripe_session FROM $t WHERE email = %s AND source = 'web' AND status = 'pending' AND hold_until > %s", $email, jmb_utc_now()), ARRAY_A);
+			"SELECT id, stripe_session, client_key FROM $t WHERE email = %s AND source = 'web' AND status = 'pending' AND hold_until > %s", $email, jmb_utc_now()), ARRAY_A);
+		foreach ($old as $o) if ($ckey === '' || !hash_equals($o['client_key'], $ckey))
+			return new WP_Error('jmb_inprogress', 'A booking for this email address is already waiting for payment. Please finish paying in that window, or try again in about 30 minutes.', ['status' => 409]);
 		foreach ($old as $o) jmb_release((int) $o['id'], $o['stripe_session']);
 
 		$idx   = jmb_index_around($date);
@@ -815,7 +828,7 @@ function jmb_rest_book(WP_REST_Request $req) {
 			'kind' => $kind, 'date' => $date, 'start_time' => $slot['start'], 'end_time' => $slot['end'],
 			'status' => 'pending', 'name' => $name, 'email' => $email, 'phone' => $phone,
 			'location' => $location, 'notes' => $notes, 'parent_id' => $parent, 'source' => 'web',
-			'created_at' => jmb_utc_now(), 'token' => $token, 'amount_cents' => $cents,
+			'created_at' => jmb_utc_now(), 'token' => $token, 'amount_cents' => $cents, 'client_key' => $ckey,
 			// Stripe Checkout cannot be paid after it expires; the extra 10 minutes covers webhook delay
 			'hold_until' => gmdate('Y-m-d H:i:s', time() + ($minutes + 10) * 60),
 		]);
@@ -1421,6 +1434,8 @@ function jmb_admin_settings() {
 		return sprintf('<input type="%s" name="jmb[%s]" value="%s" %s>', $type, $k, esc_attr($s[$k]), $attrs);
 	};
 	$secret = function ($k) use ($s) {
+		$c = jmb_secret_constants()[$k] ?? '';
+		if ($c && defined($c)) return '<code>set in wp-config.php (' . esc_html($c) . ')</code>';
 		return sprintf('<input type="password" name="jmb[%s]" value="" class="regular-text code" autocomplete="off" placeholder="%s">', $k, $s[$k] ? 'saved (leave blank to keep)' : 'not set');
 	};
 	$days = function ($k) use ($s) {

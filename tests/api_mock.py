@@ -17,6 +17,7 @@ FIXTURE = []        # events she put in her calendar herself
 CREATED = {}        # events the plugin inserted: id -> event
 GCAL_FAIL = {"on": False}
 TOKENS = []         # decoded JWT claims of every token request
+LIST_CALLS = [0]    # how many times the calendar was read (to spot request amplification)
 EVENTS_RE = re.compile(r"^/calendar/v3/calendars/([^/]+)/events(?:/([^/]+))?$")
 
 
@@ -67,7 +68,7 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/sessions.json":
             return self._send(200, SESSIONS)
         if u.path == "/gcal.json":
-            return self._send(200, {"created": CREATED, "fixture": FIXTURE, "tokens": TOKENS})
+            return self._send(200, {"created": CREATED, "fixture": FIXTURE, "tokens": TOKENS, "list_calls": LIST_CALLS[0]})
         if u.path.startswith("/pay/"):
             sid = u.path.split("/")[2]
             s = SESSIONS.get(sid)
@@ -85,6 +86,7 @@ class H(BaseHTTPRequestHandler):
         if m and not m.group(2):
             if not self._google_auth():
                 return
+            LIST_CALLS[0] += 1
             lo, hi = ts(q["timeMin"]), ts(q["timeMax"])
             items = [e for e in FIXTURE + list(CREATED.values()) if event_range(e)[0] < hi and event_range(e)[1] > lo]
             return self._send(200, {"items": items})

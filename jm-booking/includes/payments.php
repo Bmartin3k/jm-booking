@@ -30,6 +30,7 @@ function jmb_payments_install() {
 		status VARCHAR(10) NOT NULL DEFAULT 'open',
 		token CHAR(32) NOT NULL DEFAULT '',
 		stripe_session VARCHAR(255) NOT NULL DEFAULT '',
+		sessions TEXT NULL,
 		payment_id VARCHAR(255) NOT NULL DEFAULT '',
 		paid_at DATETIME NULL,
 		paid_note VARCHAR(190) NOT NULL DEFAULT '',
@@ -189,13 +190,25 @@ function jmb_pay_webhook($type, $obj) {
 	if (!$pid) return null;
 	$t = jmb_payments_table();
 	$p = $wpdb->get_row($wpdb->prepare("SELECT * FROM $t WHERE id = %d", $pid), ARRAY_A);
-	if (!$p || ($obj['id'] ?? '') !== $p['stripe_session']) return ['ok' => true, 'ignored' => 'unknown payment session'];
+	$sid   = (string) ($obj['id'] ?? '');
+	$known = $p ? preg_split('/\s+/', trim($p['stripe_session'] . ' ' . (string) $p['sessions']), -1, PREG_SPLIT_NO_EMPTY) : [];
+	if (!$p || $sid === '' || !in_array($sid, $known, true)) return ['ok' => true, 'ignored' => 'unknown payment session'];
 	if (!in_array($type, ['checkout.session.completed', 'checkout.session.async_payment_succeeded'], true)) return ['ok' => true, 'ignored' => $type];
 	if (($obj['payment_status'] ?? '') !== 'paid') return ['ok' => true, 'waiting' => 'payment not finished'];
-	if ($p['status'] === 'paid') return ['ok' => true, 'already' => true];
+	$pi     = is_string($obj['payment_intent'] ?? null) ? $obj['payment_intent'] : '';
 	$amount = (int) ($obj['amount_total'] ?? $p['amount_cents']);
+	if ($p['status'] === 'paid') {
+		if ($pi === '' || $pi === $p['payment_id'] || strpos($p['paid_note'], $pi) !== false) return ['ok' => true, 'already' => true];   // Stripe retrying
+		// a second, different payment for the same thing (e.g. two tabs): record it and ask her to refund one
+		$wpdb->update($t, ['paid_note' => mb_substr(trim($p['paid_note'] . ' | ALSO PAID ' . $pi), 0, 190)], ['id' => $pid]);
+		$b = jmb_get((int) $p['booking_id']);
+		jmb_mail_admin('Balance paid twice: please refund one' . ($b ? " ({$b['name']})" : ''),
+			($b ? "{$b['name']} " : 'A client ') . 'paid ' . jmb_money($amount, jmb_settings()) . " a second time for the same balance payment.\n\n"
+			. "First payment: {$p['payment_id']}\nSecond payment: $pi\n\nRefund one of them in Stripe: https://dashboard.stripe.com/payments/$pi\n" . admin_url('admin.php?page=jmb&show=all'));
+		return ['ok' => true, 'duplicate' => true];
+	}
 	$wpdb->update($t, ['status' => 'paid', 'paid_at' => jmb_utc_now(), 'amount_cents' => $amount,
-		'payment_id' => is_string($obj['payment_intent'] ?? null) ? $obj['payment_intent'] : '', 'paid_note' => $p['status'] === 'void' ? 'paid after it was voided' : 'Stripe'], ['id' => $pid]);
+		'payment_id' => $pi, 'paid_note' => $p['status'] === 'void' ? 'paid after it was voided' : 'Stripe'], ['id' => $pid]);
 	$p = $wpdb->get_row($wpdb->prepare("SELECT * FROM $t WHERE id = %d", $pid), ARRAY_A);
 	$b = jmb_get((int) $p['booking_id']);
 	if ($b) {
@@ -205,9 +218,15 @@ function jmb_pay_webhook($type, $obj) {
 	return ['ok' => true, 'paid' => $pid];
 }
 
+/** Close the payment's current Stripe checkout so it can no longer be paid (new checkout, amount change, paid in cash, void). */
+function jmb_pay_expire($p) {
+	if (!empty($p['stripe_session'])) jmb_stripe('POST', '/v1/checkout/sessions/' . rawurlencode($p['stripe_session']) . '/expire');
+}
+
 /** Cancelling a booking voids what is still open. */
 function jmb_pay_void_open($booking_id) {
 	global $wpdb;
+	foreach (jmb_payments_for($booking_id) as $p) if ($p['status'] === 'open') jmb_pay_expire($p);
 	$wpdb->query($wpdb->prepare('UPDATE ' . jmb_payments_table() . " SET status = 'void' WHERE booking_id = %d AND status = 'open'", $booking_id));
 }
 
@@ -217,6 +236,7 @@ add_action('template_redirect', function () {
 	global $wpdb;
 	if (!isset($_GET['jmb_pay'])) return;
 	nocache_headers();
+	jmb_private_page_headers();
 	header('X-Robots-Tag: noindex, nofollow', true);
 	header('Referrer-Policy: no-referrer', true);
 	$token = sanitize_text_field(wp_unslash($_GET['jmb_pay']));
@@ -238,6 +258,11 @@ add_action('template_redirect', function () {
 	}
 	if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 		if (!jmb_stripe_ready($s)) { echo jmb_pay_page('Online payment is not available', '<p>Please reply to the email you got from us and we will sort it out.</p>'); exit; }
+		$rl = 'jmb_pp_' . (int) $p['id'];
+		$n  = (int) get_transient($rl);
+		if ($n >= 10) { status_header(429); echo jmb_pay_page('Please wait a little', '<p>Too many payment attempts for this link. Please try again in an hour, or reply to our email.</p>'); exit; }
+		set_transient($rl, $n + 1, HOUR_IN_SECONDS);
+		jmb_pay_expire($p);   // only one open checkout per payment, so it cannot be paid twice
 		$url  = jmb_pay_url($p);
 		$sess = jmb_stripe('POST', '/v1/checkout/sessions', [
 			'mode' => 'payment', 'customer_email' => $b['email'], 'client_reference_id' => 'pay-' . (int) $p['id'],
@@ -249,7 +274,7 @@ add_action('template_redirect', function () {
 				'product_data' => ['name' => $b['kind_label'] . ' balance' . ((int) $p['parts'] > 1 ? " ({$p['part']} of {$p['parts']})" : ''), 'description' => $b['date_pretty']]]]],
 		]);
 		if (is_wp_error($sess) || empty($sess['url'])) { echo jmb_pay_page('Payment could not be started', '<p>Please try again in a moment.</p><p><a href="' . esc_url($url) . '">Back</a></p>'); exit; }
-		$wpdb->update(jmb_payments_table(), ['stripe_session' => $sess['id']], ['id' => (int) $p['id']]);
+		$wpdb->update(jmb_payments_table(), ['stripe_session' => $sess['id'], 'sessions' => trim($p['sessions'] . ' ' . $sess['id'])], ['id' => (int) $p['id']]);
 		wp_redirect($sess['url'], 303);
 		exit;
 	}
@@ -313,14 +338,16 @@ add_action('admin_post_jmb_pay_act', function () {
 			if ($ok) $wpdb->update($t, [$p['invoice_sent_at'] ? 'reminder_sent_at' : 'invoice_sent_at' => jmb_utc_now()], ['id' => $pid]);
 			$msg = $ok ? ($p['invoice_sent_at'] ? 'payment reminder sent' : 'invoice sent') : 'email could not be sent; check the email settings';
 		} elseif ($do === 'paid') {
+			jmb_pay_expire($p);
 			$wpdb->update($t, ['status' => 'paid', 'paid_at' => jmb_utc_now(), 'paid_note' => 'marked paid by hand'], ['id' => $pid]);
 			$msg = 'payment marked paid';
 		} elseif ($do === 'void') {
+			jmb_pay_expire($p);
 			$wpdb->update($t, ['status' => 'void'], ['id' => $pid]);
 			$msg = 'payment voided';
 		} elseif ($do === 'amount') {
 			$c = jmb_cents(wp_unslash($_GET['amount'] ?? ''));
-			if ($c >= 50) { $wpdb->update($t, ['amount_cents' => $c, 'stripe_session' => ''], ['id' => $pid]); $msg = 'payment amount changed to ' . jmb_money($c, jmb_settings()); }
+			if ($c >= 50) { jmb_pay_expire($p); $wpdb->update($t, ['amount_cents' => $c, 'stripe_session' => ''], ['id' => $pid]); $msg = 'payment amount changed to ' . jmb_money($c, jmb_settings()); }
 			else $msg = 'amount not changed: enter at least 0.50';
 		}
 	} elseif ($p) $msg = 'that payment is already ' . $p['status'];

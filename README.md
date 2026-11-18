@@ -46,7 +46,19 @@ The **Bookings** admin page lists bookings with links to each payment in Stripe,
 - Bookings are deleted automatically a year after the session date (setting; 0 keeps them). Signed contracts are legal records and are kept separately, 6 years by default.
 - Signed contracts can only be opened by the client through their private link, or by an admin. The page shows whether the text still matches its fingerprint.
 - A location typed by a client is never shown to other clients; only locations from the settings list are.
-- Webhooks are verified with Stripe's signature. Booking is limited per email address and per visitor IP.
+- Webhooks are verified with Stripe's signature (and refused after 5 minutes). Booking is limited per email address and per visitor IP; only the browser that started a checkout can restart it for the same email.
+- A balance payment has at most one open Stripe checkout: opening the pay page again, changing the amount, marking it paid or voiding it closes the previous one. If a client still manages to pay twice, the photographer is emailed which payment to refund.
+- Private pages (signed contract, payment) are not indexed, cannot be shown inside another site's frame, and send no referrer.
+- Secrets can be kept out of the database (and its backups) by defining them in `wp-config.php`; they then override the settings page:
+
+  ```php
+  define('JMB_STRIPE_SECRET', 'rk_live_...');
+  define('JMB_STRIPE_WEBHOOK', 'whsec_...');
+  define('JMB_GCAL_JSON', '{"type":"service_account", ...}');   // the whole key file
+  define('JMB_TURNSTILE_SITE', '0x4...');
+  define('JMB_TURNSTILE_SECRET', '0x4...');
+  ```
+- `tests/test_security.py` attacks the plugin (injection, script in every field, forged and replayed webhooks, double payments, other people's checkouts, access by non-admins, secrets on pages, request flooding, framing).
 
 ## Tests
 

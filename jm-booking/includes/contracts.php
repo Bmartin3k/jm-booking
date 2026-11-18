@@ -243,12 +243,20 @@ function jmb_contract_pdf_name($c) {
 	return 'contract-booking-' . (int) $c['booking_id'] . '-' . sanitize_file_name(strtolower(preg_replace('/\s+/', '-', $c['signer_name']))) . '.pdf';
 }
 
+/** Pages with a private link (contract, payment): never inside another site's frame, never MIME-sniffed. */
+function jmb_private_page_headers() {
+	header('X-Frame-Options: DENY', true);
+	header("Content-Security-Policy: frame-ancestors 'none'", true);
+	header('X-Content-Type-Options: nosniff', true);
+}
+
 /* ------------------------------------------------------- page for the client */
 
 add_action('template_redirect', function () {
 	if (!isset($_GET['jmb_contract'])) return;
 	$c = jmb_contract_by_token(sanitize_text_field(wp_unslash($_GET['jmb_contract'])));
 	nocache_headers();
+	jmb_private_page_headers();
 	header('X-Robots-Tag: noindex, nofollow', true);
 	header('Referrer-Policy: no-referrer', true);
 	if (!$c) { status_header(404); wp_die('This contract link is not valid.', 'Not found', ['response' => 404]); }
