@@ -15,15 +15,15 @@ cleanup() {
 trap cleanup EXIT
 cleanup
 
-echo "Starting WordPress 7.1.4, MariaDB 11 and the mock Stripe API..."
+echo "Starting WordPress 7.1.4, MariaDB 11 and the mock Stripe + Google APIs..."
 docker network create jmbtest >/dev/null
 docker run -d --name stripe-mock --network jmbtest -p 127.0.0.1:18081:8000 \
-  -v "$TESTS":/m:ro python:3.12-alpine python -u /m/stripe_mock.py >/dev/null
+  -v "$TESTS":/m:ro python:3.12-alpine python -u /m/api_mock.py >/dev/null
 docker run -d --name jmbtest-db --network jmbtest \
   -e MARIADB_ROOT_PASSWORD=t -e MARIADB_DATABASE=wp -e MARIADB_USER=wp -e MARIADB_PASSWORD=wp mariadb:11 >/dev/null
 docker run -d --name jmbtest-wp --network jmbtest -p 127.0.0.1:18080:80 -e WORDPRESS_DEBUG=1 \
   -e WORDPRESS_DB_HOST=jmbtest-db -e WORDPRESS_DB_USER=wp -e WORDPRESS_DB_PASSWORD=wp -e WORDPRESS_DB_NAME=wp \
-  -e "WORDPRESS_CONFIG_EXTRA=define('JMB_STRIPE_API','http://stripe-mock:8000');" \
+  -e "WORDPRESS_CONFIG_EXTRA=define('JMB_STRIPE_API','http://stripe-mock:8000'); define('JMB_GCAL_API','http://stripe-mock:8000/calendar/v3');" \
   -v "$ROOT/jm-booking":/var/www/html/wp-content/plugins/jm-booking:ro wordpress:7.1.4 >/dev/null
 
 for i in $(seq 1 30); do
@@ -38,12 +38,13 @@ done
 
 reset_state() {
   docker exec jmbtest-db mariadb -uwp -pwp wp -e \
-    "TRUNCATE wp_jmb_bookings; DELETE FROM wp_options WHERE option_name LIKE '%transient%jmb_%' OR option_name IN ('jmb_settings','jmb_extra')"
+    "TRUNCATE wp_jmb_bookings; DELETE FROM wp_options WHERE option_name LIKE '%transient%jmb_%' OR option_name IN ('jmb_settings','jmb_extra','jmb_gbusy_snapshot','jmb_gcal_status')"
 }
 
 status=0
 echo; echo "== Stripe checkout flow"; reset_state; python3 test_stripe.py || status=1
 echo; echo "== Extra open times";    reset_state; python3 test_extra_times.py || status=1
+echo; echo "== Google Calendar";     reset_state; python3 test_gcal.py || status=1
 
 if [ "${1:-}" = "--browser" ]; then
   echo; echo "== Browser pay flow"; reset_state

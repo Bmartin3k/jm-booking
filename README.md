@@ -8,6 +8,7 @@ A WordPress booking calendar for a photographer, with a few rules that off-the-s
 - **School-year weekdays.** Weekday hours differ between the school year (for example Wednesdays 8:30–11:00) and summer.
 - **Extra open times.** The photographer can open any date and time by hand, outside the rules.
 - **Pay to book.** Clients pay a retainer through Stripe Checkout (Stripe's hosted page, so no card data touches the site). A paid booking can be sent to Sprout Studio as a new lead through a Zapier webhook.
+- **Google Calendar, both ways.** Anything on her calendar closes that time (on weekends, the whole day), and paid bookings are added to her calendar and removed again if cancelled.
 
 All numbers above are settings. The calendar picks up the colors of the Kadence theme automatically and falls back to a neutral look on other themes.
 
@@ -18,6 +19,7 @@ All numbers above are settings. The calendar picks up the colors of the Kadence 
 3. Put the shortcode `[jm_booking]` on a page.
 4. Fill in **Bookings → Settings**:
    - **Payment:** the amount charged at booking, a Stripe secret key (a restricted key with only *Checkout Sessions: Write* is enough), and a Stripe webhook pointing at the URL shown on the page, with the events `checkout.session.completed`, `checkout.session.async_payment_succeeded` and `checkout.session.expired`. Online booking stays off until both keys are saved.
+   - **Google Calendar (optional):** create a Google Cloud project with the Google Calendar API enabled, add a service account and download its JSON key, paste the key into the settings, share the calendar with the service account's email ("Make changes to events"), and enter the calendar ID (the Gmail address for a main calendar). "Check Google Calendar" tests reading and writing.
    - **Spam protection (recommended):** Cloudflare Turnstile site and secret keys.
    - **Sprout Studio (optional):** a Zapier "Catch Hook" URL; the Zap's action is *Sprout Studio → Create Lead*.
 
@@ -27,7 +29,9 @@ Requires WordPress 6.4+ and PHP 8.0+. WordPress needs to be able to send email f
 
 1. The client picks a time and fills in the form, then is sent to Stripe Checkout.
 2. The time is held for 30 minutes while they pay. Pressing Back on Stripe releases it at once; otherwise it is released when the checkout expires.
-3. Stripe calls the webhook, the booking is confirmed, the client and the photographer get an email, and the booking goes to Zapier.
+3. Stripe calls the webhook, the booking is confirmed, the client and the photographer get an email, the booking goes to Zapier, and it is added to her Google Calendar.
+
+Her Google Calendar is read when the calendar loads (cached for 5 minutes) and again, fresh, right before a booking is saved. Events marked "Free" are ignored. If Google can't be reached, the last known busy days stay closed.
 
 The **Bookings** admin page lists bookings with links to each payment in Stripe, and has forms to open extra times and to add bookings made outside the website. Cancelling a booking there does not refund it; refunds are done in Stripe.
 
@@ -39,7 +43,7 @@ The **Bookings** admin page lists bookings with links to each payment in Stripe,
 
 ## Tests
 
-`tests/run.sh` starts a throwaway WordPress, MariaDB and a small mock of the Stripe API in Docker, runs the test suites against them, and removes everything afterwards. `tests/run.sh --browser` also runs the pay flow in headless Chrome.
+`tests/run.sh` starts a throwaway WordPress, MariaDB and a small mock of the Stripe and Google Calendar APIs in Docker, runs the test suites against them, and removes everything afterwards. `tests/run.sh --browser` also runs the pay flow in headless Chrome.
 
 The tests use fixed dates in December 2026 and will need new dates once those are in the past.
 
