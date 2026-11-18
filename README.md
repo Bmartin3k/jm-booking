@@ -8,6 +8,7 @@ A WordPress booking calendar for a photographer, with a few rules that off-the-s
 - **School-year weekdays.** Weekday hours differ between the school year (for example Wednesdays 8:30–11:00) and summer.
 - **Extra open times.** The photographer can open any date and time by hand, outside the rules.
 - **Pay to book.** Clients pay a retainer through Stripe Checkout (Stripe's hosted page, so no card data touches the site). A paid booking can be sent to Sprout Studio as a new lead through a Zapier webhook.
+- **Contracts with e-signature.** Before paying, the client reads the contract with their details filled in, ticks two consent boxes and types their name. The exact text, its SHA-256 fingerprint, the signature, time, IP and browser are stored, and the client is emailed a PDF copy.
 - **Google Calendar, both ways.** Anything on her calendar closes that time (on weekends, the whole day), and paid bookings are added to her calendar and removed again if cancelled.
 
 All numbers above are settings. The calendar picks up the colors of the Kadence theme automatically and falls back to a neutral look on other themes.
@@ -19,6 +20,7 @@ All numbers above are settings. The calendar picks up the colors of the Kadence 
 3. Put the shortcode `[jm_booking]` on a page.
 4. Fill in **Bookings → Settings**:
    - **Payment:** the amount charged at booking, a Stripe secret key (a restricted key with only *Checkout Sessions: Write* is enough), and a Stripe webhook pointing at the URL shown on the page, with the events `checkout.session.completed`, `checkout.session.async_payment_succeeded` and `checkout.session.expired`. Online booking stays off until both keys are saved.
+   - **Contract (optional):** tick "Clients sign the contract before they pay" and paste the contract text. Plain text with `#` headings and fill-in fields such as `{client_name}`, `{session_date}`, `{location}`, `{price}` and `{retainer}` (the full list is on the settings page). A separate mini-session contract is optional.
    - **Google Calendar (optional):** create a Google Cloud project with the Google Calendar API enabled, add a service account and download its JSON key, paste the key into the settings, share the calendar with the service account's email ("Make changes to events"), and enter the calendar ID (the Gmail address for a main calendar). "Check Google Calendar" tests reading and writing.
    - **Spam protection (recommended):** Cloudflare Turnstile site and secret keys.
    - **Sprout Studio (optional):** a Zapier "Catch Hook" URL; the Zap's action is *Sprout Studio → Create Lead*.
@@ -27,7 +29,7 @@ Requires WordPress 6.4+ and PHP 8.0+. WordPress needs to be able to send email f
 
 ## How a booking works
 
-1. The client picks a time and fills in the form, then is sent to Stripe Checkout.
+1. The client picks a time and fills in the form, signs the contract (when contracts are on), then is sent to Stripe Checkout.
 2. The time is held for 30 minutes while they pay. Pressing Back on Stripe releases it at once; otherwise it is released when the checkout expires.
 3. Stripe calls the webhook, the booking is confirmed, the client and the photographer get an email, the booking goes to Zapier, and it is added to her Google Calendar.
 
@@ -37,13 +39,14 @@ The **Bookings** admin page lists bookings with links to each payment in Stripe,
 
 ## Privacy and security
 
-- Bookings are deleted automatically a year after the session date (setting; 0 keeps them).
+- Bookings are deleted automatically a year after the session date (setting; 0 keeps them). Signed contracts are legal records and are kept separately, 6 years by default.
+- Signed contracts can only be opened by the client through their private link, or by an admin. The page shows whether the text still matches its fingerprint.
 - A location typed by a client is never shown to other clients; only locations from the settings list are.
 - Webhooks are verified with Stripe's signature. Booking is limited per email address and per visitor IP.
 
 ## Tests
 
-`tests/run.sh` starts a throwaway WordPress, MariaDB and a small mock of the Stripe and Google Calendar APIs in Docker, runs the test suites against them, and removes everything afterwards. `tests/run.sh --browser` also runs the pay flow in headless Chrome.
+`tests/run.sh` starts a throwaway WordPress, MariaDB and a small mock of the Stripe and Google Calendar APIs in Docker, runs the test suites against them, and removes everything afterwards. `tests/run.sh --browser` also runs the pay and contract-signing flows in headless Chrome. `KEEP=1 tests/run.sh` leaves the test site running at http://127.0.0.1:18080 (admin / admin) for poking around. `tests/mu/mail-log.php` records outgoing email in the test site only.
 
 The tests use fixed dates in December 2026 and will need new dates once those are in the past.
 

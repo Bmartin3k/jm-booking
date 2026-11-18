@@ -2,15 +2,17 @@
 /**
  * Plugin Name: JM Session Booking
  * Description: Booking calendar: sunset-based weekend sessions, a cap on booked weekends per month, a discounted mini session that opens on booked days, school-year / summer weekday hours. Clients pay online with Stripe Checkout; paid bookings are sent to Sprout Studio through Zapier. Shortcode: [jm_booking]
- * Version: 2.2.0
+ * Version: 2.3.0
  * Requires PHP: 8.0
  * Requires at least: 6.4
  */
 
 if (!defined('ABSPATH')) exit;
 
-const JMB_VER    = '2.2.0';
-const JMB_DB_VER = '4';   // bump to re-run jmb_install() on update (table columns + cron events)
+const JMB_VER    = '2.3.0';
+const JMB_DB_VER = '5';   // bump to re-run jmb_install() on update (table columns + cron events)
+
+require_once __DIR__ . '/includes/contracts.php';
 
 /* ------------------------------------------------------------------ setup */
 
@@ -64,6 +66,11 @@ function jmb_defaults() {
 		'gcal_mode'        => 'weekend_day', // weekend_day | day | overlap
 		'gcal_buffer'      => 30,            // minutes kept free around her events (overlap checks)
 		'gcal_push'        => 1,             // add paid bookings to her calendar
+		'contract_on'      => 0,             // clients e-sign the contract before paying
+		'contract_full'    => '',            // contract template (plain text, # headings, {fields})
+		'contract_mini'    => '',            // optional separate template for mini sessions
+		'business_name'    => '',            // shown in contracts (default: site name)
+		'contract_retain_years' => 6,        // keep signed contracts this long (0 = forever)
 	];
 }
 
@@ -112,6 +119,7 @@ function jmb_install() {
 		KEY email (email),
 		KEY token (token)
 	) $c;");
+	jmb_contract_install();
 	update_option('jmb_db_ver', JMB_DB_VER);
 	if (!wp_next_scheduled('jmb_expire_holds')) wp_schedule_event(time() + 300, 'hourly', 'jmb_expire_holds');
 	if (!wp_next_scheduled('jmb_purge_old')) wp_schedule_event(time() + 600, 'daily', 'jmb_purge_old');
@@ -621,6 +629,7 @@ add_action('rest_api_init', function () {
 		['/status', 'GET', 'jmb_rest_status'],
 		['/cancel', 'POST', 'jmb_rest_cancel'],
 		['/stripe', 'POST', 'jmb_rest_stripe'],
+		['/contract', 'POST', 'jmb_rest_contract'],
 	];
 	foreach ($routes as [$path, $method, $cb])
 		register_rest_route('jmb/v1', $path, ['methods' => $method, 'permission_callback' => '__return_true', 'callback' => $cb]);
@@ -649,6 +658,7 @@ function jmb_rest_availability(WP_REST_Request $req) {
 		'max'              => max($now->setTime(0, 0)->modify('+' . (int) $s['max_ahead_days'] . ' days')->format('Y-m-d'), $last_extra),
 		'checkout_minutes' => max(30, (int) $s['checkout_minutes']),
 		'online'           => jmb_stripe_ready($s),
+		'contract'         => jmb_contract_enabled($s),
 		'days'             => $days,
 	]);
 	$res->header('Cache-Control', 'no-store');
@@ -686,6 +696,38 @@ function jmb_turnstile_ok($token, $s) {
 function jmb_valid_date($ymd) {
 	if (!preg_match('/^(\d{4})-(\d{2})-(\d{2})$/', (string) $ymd, $m)) return false;
 	return checkdate((int) $m[2], (int) $m[3], (int) $m[1]);
+}
+
+/** The fields a contract is filled in with, for a requested slot (same for preview and booking). */
+function jmb_contract_data_for($kind, $date, $start, $name, $email, $phone, $location, $s) {
+	$mins = $kind === 'mini' ? (int) $s['mini_minutes'] : (int) $s['full_minutes'];
+	$end  = (new DateTimeImmutable("$date $start", jmb_tz()))->modify("+$mins minutes")->format('H:i');
+	if ($kind === 'mini') {
+		$f = jmb_full_on(jmb_index_around($date), $date);
+		$location = $f ? (jmb_location_is_public($f['location'], $s) ? $f['location'] : 'Same spot as booking #' . (int) $f['id']) : $location;
+	}
+	return compact('kind', 'date', 'start', 'end', 'name', 'email', 'phone', 'location');
+}
+
+/** Contract preview: the exact text (with the client's details) the client will sign, plus its fingerprint. */
+function jmb_rest_contract(WP_REST_Request $req) {
+	$s = jmb_settings();
+	if (!jmb_contract_enabled($s)) return new WP_Error('jmb_none', 'No contract is needed.', ['status' => 404]);
+	$key  = 'jmb_rc_' . md5(jmb_client_ip());
+	$hits = (int) get_transient($key);
+	if ($hits >= 40) return new WP_Error('jmb_rate', 'Too many requests. Please try again later.', ['status' => 429]);
+	set_transient($key, $hits + 1, HOUR_IN_SECONDS);
+	$p     = $req->get_json_params() ?: $req->get_body_params();
+	$kind  = ($p['kind'] ?? '') === 'mini' ? 'mini' : 'full';
+	$date  = (string) ($p['date'] ?? '');
+	$start = (string) ($p['start'] ?? '');
+	$name  = sanitize_text_field($p['name'] ?? '');
+	$email = sanitize_email($p['email'] ?? '');
+	if (!jmb_valid_date($date) || !preg_match('/^([01]\d|2[0-3]):[0-5]\d$/', $start)) return new WP_Error('jmb_bad', 'Please pick a date and time.', ['status' => 400]);
+	if (mb_strlen($name) < 2 || !is_email($email)) return new WP_Error('jmb_bad', 'Please enter your name and email first.', ['status' => 400]);
+	$d = jmb_contract_data_for($kind, $date, $start, $name, $email, mb_substr(sanitize_text_field($p['phone'] ?? ''), 0, 40), mb_substr(sanitize_text_field($p['location'] ?? ''), 0, 200), $s);
+	[$title, , $blocks, $hash] = jmb_contract_render($d, $s);
+	return ['title' => $title, 'blocks' => $blocks, 'hash' => $hash, 'consents' => jmb_contract_consents()];
 }
 
 function jmb_rest_book(WP_REST_Request $req) {
@@ -726,6 +768,13 @@ function jmb_rest_book(WP_REST_Request $req) {
 	$cents = jmb_charge_cents($kind, $s);
 	if ($cents < 50) return new WP_Error('jmb_offline', 'Online booking is not available for this session type. Please contact us to book.', ['status' => 503]);
 
+	$render = null; $signature = '';
+	if (jmb_contract_enabled($s)) {
+		$render    = jmb_contract_render(jmb_contract_data_for($kind, $date, $start, $name, $email, $phone, $location, $s), $s);
+		$signature = jmb_contract_check_request($p, $render);
+		if (is_wp_error($signature)) return $signature;
+	}
+
 	$t       = jmb_table();
 	$minutes = max(30, (int) $s['checkout_minutes']);
 	$token   = wp_generate_password(32, false);
@@ -759,6 +808,7 @@ function jmb_rest_book(WP_REST_Request $req) {
 			'hold_until' => gmdate('Y-m-d H:i:s', time() + ($minutes + 10) * 60),
 		]);
 		$id = (int) $wpdb->insert_id;
+		if ($id && $render) jmb_contract_save($id, $kind, $render, $name, $email, $signature);
 	} finally {
 		$wpdb->query("SELECT RELEASE_LOCK('jmb_book')");
 	}
@@ -947,13 +997,25 @@ function jmb_mail_confirmed($b) {
 	$site = wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES);
 	$paid = $b['amount_cents'] ? ' We received your ' . jmb_money((int) $b['amount_cents'], $s) . ' ' . strtolower($s['charge_label']) . '.' : '';
 	$where = $b['location'] && !$b['private_loc'] ? " at {$b['location']}" : '';
+	$c     = jmb_contract_for_booking((int) $b['id']);
+	$files = [];
+	if ($c) {
+		$dir  = trailingslashit(get_temp_dir()) . 'jmb-' . wp_generate_password(12, false);
+		if (wp_mkdir_p($dir)) {
+			$file = $dir . '/' . jmb_contract_pdf_name($c);
+			if (file_put_contents($file, jmb_contract_pdf($c)) !== false) $files[] = $file;
+		}
+	}
 	if ($b['email']) wp_mail($b['email'], "You're booked! {$b['kind_label']} – {$b['date_pretty']}",
 		"Hi {$b['name']},\n\nYour {$b['kind_label']} on {$b['date_pretty']}, {$b['time_pretty']}$where is confirmed.$paid\n\n"
 		. ($b['private_loc'] ? "We'll send you the exact location before your session.\n\n" : '')
-		. "We'll be in touch with the details. See you then!\n\n$site");
+		. ($c ? "Your signed contract is attached as a PDF. You can also view it any time here (keep this link private):\n" . jmb_contract_url($c) . "\n\n" : '')
+		. "We'll be in touch with the details. See you then!\n\n$site", '', $files);
+	foreach ($files as $f) { @unlink($f); @rmdir(dirname($f)); }
 	jmb_mail_admin("New booking: {$b['name']}, {$b['date_pretty']}",
 		"{$b['kind_label']} #{$b['id']} is booked" . ($b['amount_cents'] ? ' and paid (' . jmb_money((int) $b['amount_cents'], $s) . ')' : '') . ".\n\n"
 		. "{$b['date_pretty']}, {$b['time_pretty']}\nName: {$b['name']}\nEmail: {$b['email']}\nPhone: {$b['phone']}\nLocation: {$b['location']}\nNotes: {$b['notes']}\n\n"
+		. ($c ? 'Contract signed by "' . $c['signature'] . '": ' . admin_url('admin.php?page=jmb-contract&id=' . (int) $c['id']) . "\n\n" : '')
 		. admin_url('admin.php?page=jmb'));
 }
 
@@ -1090,7 +1152,7 @@ function jmb_admin_bookings() {
 	if (!jmb_stripe_ready($s)) echo '<div class="notice notice-warning"><p>Online booking is off until the Stripe keys are saved on the <a href="' . esc_url(admin_url('admin.php?page=jmb-settings')) . '">Settings</a> page.</p></div>';
 	if (!empty($_GET['msg'])) echo '<div class="notice notice-success is-dismissible"><p>Booking ' . esc_html(wp_unslash($_GET['msg'])) . '.</p></div>';
 	echo '<p><a href="' . esc_url(admin_url('admin.php?page=jmb')) . '">Upcoming</a> | <a href="' . esc_url(admin_url('admin.php?page=jmb&show=all')) . '">All</a></p>';
-	echo '<table class="widefat striped"><thead><tr><th>#</th><th>Date</th><th>Time</th><th>Type</th><th>Status</th><th>Paid</th><th>Client</th><th>Location</th><th>Sent to</th><th></th></tr></thead><tbody>';
+	echo '<table class="widefat striped"><thead><tr><th>#</th><th>Date</th><th>Time</th><th>Type</th><th>Status</th><th>Paid / contract</th><th>Client</th><th>Location</th><th>Sent to</th><th></th></tr></thead><tbody>';
 	if (!$rows) echo '<tr><td colspan="10">No bookings.</td></tr>';
 	foreach ($rows as $r) {
 		$b = jmb_get((int) $r['id']);
@@ -1098,6 +1160,8 @@ function jmb_admin_bookings() {
 		$paid = '';
 		if ($r['payment_id']) $paid = '<a href="' . esc_url($dash . rawurlencode($r['payment_id'])) . '" target="_blank" rel="noopener">' . esc_html(jmb_money((int) $r['amount_cents'], $s)) . '</a>';
 		elseif ($r['status'] === 'confirmed' && $r['source'] === 'web') $paid = 'by hand';
+		$con = jmb_contract_for_booking((int) $r['id']);
+		if ($con) $paid .= ($paid ? '<br>' : '') . '<a href="' . esc_url(admin_url('admin.php?page=jmb-contract&id=' . (int) $con['id'])) . '">contract signed</a>';
 		$acts = [];
 		if (in_array($r['status'], ['pending', 'expired', 'cancelled'], true) && $r['source'] === 'web')
 			$acts[] = '<a href="' . esc_url(jmb_action_url('confirm', $r['id'])) . '" onclick="return confirm(\'Mark this booking as paid (outside Stripe)?\')">Mark paid</a>';
@@ -1197,6 +1261,10 @@ add_action('admin_post_jmb_save', function () {
 		}
 	}
 	if (!empty($in['gcal_clear'])) $out['gcal_json'] = '';
+	$out['contract_on']   = empty($in['contract_on']) ? 0 : 1;
+	$out['business_name'] = sanitize_text_field($in['business_name'] ?? '');
+	foreach (['contract_full', 'contract_mini'] as $k) $out[$k] = sanitize_textarea_field($in[$k] ?? '');
+	$out['contract_retain_years'] = isset($in['contract_retain_years']) && is_numeric($in['contract_retain_years']) ? max(0, (int) $in['contract_retain_years']) : $d['contract_retain_years'];
 	unset($out['inbound_key'], $out['hold_hours']);   // from the Sprout-hold version
 	update_option('jmb_settings', $out);
 	wp_safe_redirect(admin_url('admin.php?page=jmb-settings&saved=1'));
@@ -1293,6 +1361,16 @@ function jmb_admin_settings() {
 	echo '<tr><th>Webhook</th><td>Endpoint URL <input type="text" readonly class="large-text code" value="' . esc_attr($hook) . '" onclick="this.select()"><br>Signing secret ' . $secret('stripe_webhook') . '<p class="description">Stripe dashboard → Developers → Webhooks → Add endpoint with the URL above and the events <code>checkout.session.completed</code>, <code>checkout.session.async_payment_succeeded</code> and <code>checkout.session.expired</code>. Paste its signing secret (<code>whsec_…</code>) here. Bookings confirm only when Stripe calls this.</p>
 		<label><input type="checkbox" name="jmb[stripe_clear]" value="1"> remove saved Stripe keys</label></td></tr>';
 	echo '<tr><th>Checkout time</th><td>A time is held for ' . $f('checkout_minutes', 'number', 'min="30" max="1440" style="width:80px"') . ' minutes while the client pays (Stripe minimum 30). Unpaid holds are released automatically.</td></tr>';
+	$ph = "# Photography Agreement\n\nThis agreement is between {business_name} (the Photographer) and {client_name} (the Client) for a {session_type} on {session_date}, {session_time}, at {location}.\n\n# Fees\n\nThe session fee is {price}. A non-refundable retainer of {retainer} is paid at booking.\n\n# ...your terms...";
+	echo '</table><h2>Contract</h2><table class="form-table">';
+	echo '<tr><th>Signing</th><td><label><input type="checkbox" name="jmb[contract_on]" value="1" ' . checked($s['contract_on'], 1, false) . '> Clients sign the contract before they pay</label>'
+		. (empty($s['contract_on']) || trim($s['contract_full']) !== '' ? '' : '<p style="color:#b32d2e">Paste the contract text below; until then no contract is shown.</p>')
+		. '<p class="description">They read the contract with their details filled in, tick "I agree to sign electronically" and "I have read and agree", and type their full name. The exact text, a SHA-256 fingerprint, their typed signature, time, IP address and browser are stored, and they are emailed a PDF copy once paid.</p></td></tr>';
+	echo '<tr><th>Business name</th><td>' . $f('business_name', 'text', 'class="regular-text" placeholder="' . esc_attr(wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES)) . '"') . '</td></tr>';
+	echo '<tr><th>Contract</th><td><textarea name="jmb[contract_full]" rows="16" class="large-text" placeholder="' . esc_attr($ph) . '">' . esc_textarea($s['contract_full']) . '</textarea>'
+		. '<p class="description">Plain text. A blank line starts a new paragraph; a line starting with <code>#</code> is a heading. Fill-in fields: <code>{client_name}</code> <code>{client_email}</code> <code>{client_phone}</code> <code>{session_type}</code> <code>{session_date}</code> <code>{session_time}</code> <code>{session_length}</code> <code>{location}</code> <code>{price}</code> <code>{retainer}</code> <code>{business_name}</code> <code>{today}</code>. Changing the text only affects new bookings; signed copies never change.</p></td></tr>';
+	echo '<tr><th>Mini session contract</th><td><textarea name="jmb[contract_mini]" rows="6" class="large-text" placeholder="Leave empty to use the contract above">' . esc_textarea($s['contract_mini']) . '</textarea></td></tr>';
+	echo '<tr><th>Keep signed contracts</th><td>' . $f('contract_retain_years', 'number', 'min="0" style="width:70px"') . ' years after signing (0 = forever). Not affected by the booking clean-up.</td></tr>';
 	echo '</table><h2>Weekends (golden hour)</h2><table class="form-table">';
 	echo '<tr><th>Sunset timing</th><td>The full session ends ' . $f('sunset_offset', 'number', 'step="5" style="width:80px"') . ' minutes after sunset (negative = before). Start times round down to the quarter hour.</td></tr>';
 	echo '<tr><th>Location for sunset</th><td>Latitude ' . $f('lat', 'text', 'style="width:110px"') . ' Longitude ' . $f('lon', 'text', 'style="width:110px"') . ' Time zone ' . $f('timezone', 'text', 'style="width:170px"') . '</td></tr>';

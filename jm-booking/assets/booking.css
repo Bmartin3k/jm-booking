@@ -83,3 +83,14 @@
 	.jmb-day { font-size: .9rem; }
 	.jmb-tag { font-size: .5rem; }
 }
+/* contract step */
+.jmb-form[hidden] { display: none; }
+.jmb-back[hidden] { display: none; }
+.jmb-contract-box { max-height: 55vh; overflow: auto; padding: .75rem 1rem; border: 1px solid var(--jmb-line); border-radius: var(--jmb-radius); background: var(--jmb-surface); font-size: .92rem; line-height: 1.5; }
+.jmb-contract-box:focus-visible { outline: 2px solid var(--jmb-edge); outline-offset: 1px; }
+.jmb-contract-box h4 { font-family: var(--jmb-heading); font-size: 1.15rem; letter-spacing: .02em; margin: 1rem 0 .3rem; }
+.jmb-contract-box h4:first-child { margin-top: 0; font-size: 1.35rem; }
+.jmb-contract-box p { margin: 0 0 .7rem; white-space: pre-line; }
+.jmb-check { display: flex; gap: .55rem; align-items: flex-start; font-size: .92rem; cursor: pointer; }
+.jmb-check input { margin-top: .25rem; width: 1.05rem; height: 1.05rem; flex: none; accent-color: var(--jmb-edge); }
+.jmb-sig-input { font-family: "Brush Script MT", "Segoe Script", "Snell Roundhand", cursive !important; font-size: 1.35rem !important; }

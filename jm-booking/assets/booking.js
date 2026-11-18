@@ -178,37 +178,108 @@
 			var btn = el('button', { type: 'submit', class: 'jmb-submit', text: 'Continue to payment' });
 			f.appendChild(btn);
 			f.appendChild(msg);
-			f.addEventListener('submit', function (e) {
-				e.preventDefault();
+			if (data.contract) btn.textContent = 'Review and sign the contract';
+			var idleText = btn.textContent;
+
+			function turnstileToken() { return ts && window.turnstile && tsId !== null ? window.turnstile.getResponse(tsId) : ''; }
+
+			function collect() {
 				var body = { kind: s.kind, date: s.date, start: s.start, return_url: location.origin + location.pathname };
 				Array.prototype.forEach.call(f.elements, function (x) { if (x.name) body[x.name] = x.value.trim(); });
-				if (ts) {
-					body.cf_turnstile = window.turnstile && tsId !== null ? window.turnstile.getResponse(tsId) : '';
-					if (!body.cf_turnstile) { msg.textContent = 'Please complete the "verify you are human" check.'; return; }
-				}
 				if ('location_pick' in body) {
 					body.location = body.location_pick === OTHER ? body.location_other : body.location_pick;
 					delete body.location_pick;
 					delete body.location_other;
 				}
-				if (!body.name || !body.email || (s.kind === 'full' && !body.location)) { msg.textContent = 'Please fill in your name, email' + (s.kind === 'full' ? ' and location.' : '.'); return; }
+				return body;
+			}
+
+			function post(path, body) {
+				return fetch(cfg.api + path, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+					.then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j || {} }; }); });
+			}
+
+			/* Book and go to Stripe. onFail(code, message) puts the right step back. */
+			function book(body, button, out, onFail) {
+				if (ts) body.cf_turnstile = turnstileToken();
+				button.disabled = true;
+				button.textContent = 'Opening payment…';
+				out.textContent = '';
+				post('book', body).then(function (res) {
+					if (!res.ok) { var e = new Error(res.j.message || 'Something went wrong.'); e.code = res.j.code; throw e; }
+					if (!res.j.checkout_url) throw new Error('Payment could not be started. Please try again.');
+					window.location.assign(res.j.checkout_url);
+				}).catch(function (err) {
+					if (ts && window.turnstile && tsId !== null) window.turnstile.reset(tsId);
+					onFail(err.code, err.message);
+					load();
+				});
+			}
+
+			/* Step 2: the contract with their details filled in; they tick both boxes and type their name. */
+			function showContract(body, note) {
 				btn.disabled = true;
-				btn.textContent = 'Opening payment…';
+				btn.textContent = 'Loading the contract…';
 				msg.textContent = '';
-				fetch(cfg.api + 'book', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-					.then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
-					.then(function (res) {
-						if (!res.ok) throw new Error(res.j && res.j.message || 'Something went wrong.');
-						if (!res.j.checkout_url) throw new Error('Payment could not be started. Please try again.');
-						window.location.assign(res.j.checkout_url);
-					})
-					.catch(function (err) {
-						msg.textContent = err.message;
-						if (ts && window.turnstile && tsId !== null) window.turnstile.reset(tsId);
-						btn.disabled = false;
-						btn.textContent = 'Continue to payment';
-						load();
+				post('contract', body).then(function (res) {
+					btn.disabled = false;
+					btn.textContent = idleText;
+					if (!res.ok) { msg.textContent = res.j.message || 'The contract could not be loaded. Please try again.'; return; }
+					var c = res.j;
+					var step = el('form', { class: 'jmb-form jmb-sign', novalidate: true });
+					var edit = el('button', { type: 'button', class: 'jmb-back' }, ['‹ Edit your details']);
+					edit.addEventListener('click', function () { step.remove(); edit.remove(); f.hidden = false; back.hidden = false; });
+					var box = el('div', { class: 'jmb-contract-box', tabindex: '0', role: 'region', 'aria-label': c.title });
+					c.blocks.forEach(function (b) { box.appendChild(el(b[0] === 'h' ? 'h4' : 'p', { text: b[1] })); });
+					var esign = el('input', { type: 'checkbox', name: 'agree_esign', value: '1' });
+					var agree = el('input', { type: 'checkbox', name: 'agree_terms', value: '1' });
+					var sig = el('input', { name: 'signature', required: true, autocomplete: 'name', maxlength: 120, class: 'jmb-sig-input', placeholder: 'Your full name' });
+					var out = el('p', { class: 'jmb-msg', role: 'alert', text: note || '' });
+					var go = el('button', { type: 'submit', class: 'jmb-submit', text: 'Sign and continue to payment' });
+					step.appendChild(el('p', { class: 'jmb-summary' }, [el('strong', { text: 'Please read and sign' }), ' · ' + s.label + ', ' + prettyDate(s.date) + ', ' + s.time]));
+					step.appendChild(box);
+					step.appendChild(el('label', { class: 'jmb-check' }, [esign, el('span', { text: c.consents.esign })]));
+					step.appendChild(el('label', { class: 'jmb-check' }, [agree, el('span', { text: c.consents.agree })]));
+					step.appendChild(field('Type your full name to sign', sig));
+					step.appendChild(el('p', { class: 'jmb-fine', text: 'A copy of the signed contract is emailed to you once your payment goes through.' }));
+					step.appendChild(go);
+					step.appendChild(out);
+					step.addEventListener('submit', function (e) {
+						e.preventDefault();
+						if (!esign.checked || !agree.checked) { out.textContent = 'Please tick both boxes to sign.'; return; }
+						if (sig.value.trim().length < 2) { out.textContent = 'Please type your full name to sign.'; sig.focus(); return; }
+						var full = Object.assign(collect(), { contract_hash: c.hash, signature: sig.value.trim(), agree_esign: 1, agree_terms: 1 });
+						book(full, go, out, function (code, text) {
+							if (code === 'jmb_contract_changed') { step.remove(); edit.remove(); showContract(collect(), text); return; }
+							out.textContent = text;
+							go.disabled = false;
+							go.textContent = 'Sign and continue to payment';
+						});
 					});
+					f.hidden = true;
+					back.hidden = true;
+					panel.appendChild(edit);
+					panel.appendChild(step);
+					edit.focus();
+					panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+				}).catch(function () {
+					btn.disabled = false;
+					btn.textContent = idleText;
+					msg.textContent = 'The contract could not be loaded. Please try again.';
+				});
+			}
+
+			f.addEventListener('submit', function (e) {
+				e.preventDefault();
+				var body = collect();
+				if (ts && !turnstileToken()) { msg.textContent = 'Please complete the "verify you are human" check.'; return; }
+				if (!body.name || !body.email || (s.kind === 'full' && !body.location)) { msg.textContent = 'Please fill in your name, email' + (s.kind === 'full' ? ' and location.' : '.'); return; }
+				if (data.contract) { showContract(body); return; }
+				book(body, btn, msg, function (code, text) {
+					msg.textContent = text;
+					btn.disabled = false;
+					btn.textContent = idleText;
+				});
 			});
 			panel.appendChild(back);
 			panel.appendChild(f);
