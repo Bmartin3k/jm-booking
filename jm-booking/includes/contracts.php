@@ -73,6 +73,8 @@ function jmb_contract_fields($d, $s) {
 		'{location}'      => $loc !== '' ? $loc : '(to be agreed)',
 		'{price}'         => $d['kind'] === 'mini' ? $s['mini_price'] : $s['full_price'],
 		'{retainer}'      => $cents ? jmb_money($cents, $s) : '',
+		'{balance}'       => jmb_balance_cents($d['kind'], $s) ? jmb_money(jmb_balance_cents($d['kind'], $s), $s) : jmb_money(0, $s),
+		'{balance_due}'   => (int) $s['pay_due_days'] . ' days before the session',
 		'{today}'         => jmb_now()->format('F j, Y'),
 	];
 }

@@ -39,7 +39,7 @@ done
 
 reset_state() {
   docker exec jmbtest-db mariadb -uwp -pwp wp -e \
-    "TRUNCATE wp_jmb_bookings; DELETE FROM wp_options WHERE option_name LIKE '%transient%jmb_%' OR option_name IN ('jmb_settings','jmb_extra','jmb_gbusy_snapshot','jmb_gcal_status','jmb_test_mail','jmb_test_mail_fail','jmb_emails_last_run'); TRUNCATE wp_jmb_contracts; TRUNCATE wp_jmb_emails"
+    "TRUNCATE wp_jmb_bookings; DELETE FROM wp_options WHERE option_name LIKE '%transient%jmb_%' OR option_name IN ('jmb_settings','jmb_extra','jmb_gbusy_snapshot','jmb_gcal_status','jmb_test_mail','jmb_test_mail_fail','jmb_emails_last_run','jmb_pay_since'); TRUNCATE wp_jmb_contracts; TRUNCATE wp_jmb_emails; TRUNCATE wp_jmb_payments"
 }
 
 status=0
@@ -48,6 +48,7 @@ echo; echo "== Extra open times";    reset_state; python3 test_extra_times.py ||
 echo; echo "== Google Calendar";     reset_state; python3 test_gcal.py || status=1
 echo; echo "== Contracts";           reset_state; python3 test_contracts.py || status=1
 echo; echo "== Automatic emails";    reset_state; python3 test_emails.py || status=1
+echo; echo "== Balance payments";    reset_state; python3 test_balance.py || status=1
 
 if [ "${1:-}" = "--browser" ]; then
   echo; echo "== Browser pay flow"; reset_state

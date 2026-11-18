@@ -177,7 +177,6 @@ code, j = book(details(kind="mini", start="14:00", name="Mia Mini", email="mia@e
 check("C12b mini signs and books", code == 200, (code, j))
 
 # ------------------------------------------------------------ admin pages
-cj = http.cookiejar.CookieJar() if False else None
 jar = __import__("http.cookiejar").cookiejar.CookieJar()
 op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 op.open(BASE + "/wp-login.php")

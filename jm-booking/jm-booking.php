@@ -2,18 +2,19 @@
 /**
  * Plugin Name: JM Session Booking
  * Description: Booking calendar: sunset-based weekend sessions, a cap on booked weekends per month, a discounted mini session that opens on booked days, school-year / summer weekday hours. Clients pay online with Stripe Checkout; paid bookings are sent to Sprout Studio through Zapier. Shortcode: [jm_booking]
- * Version: 2.4.0
+ * Version: 2.5.0
  * Requires PHP: 8.0
  * Requires at least: 6.4
  */
 
 if (!defined('ABSPATH')) exit;
 
-const JMB_VER    = '2.4.0';
-const JMB_DB_VER = '6';   // bump to re-run jmb_install() on update (table columns + cron events)
+const JMB_VER    = '2.5.0';
+const JMB_DB_VER = '7';   // bump to re-run jmb_install() on update (table columns + cron events)
 
 require_once __DIR__ . '/includes/contracts.php';
 require_once __DIR__ . '/includes/emails.php';
+require_once __DIR__ . '/includes/payments.php';
 
 /* ------------------------------------------------------------------ setup */
 
@@ -74,6 +75,12 @@ function jmb_defaults() {
 		'contract_retain_years' => 6,        // keep signed contracts this long (0 = forever)
 		'emails'           => [],            // automatic emails: per key on/days/hour/late/subject/body (see includes/emails.php)
 		'emails_minis'     => 1,             // send them for mini sessions too
+		'pay_on'           => 0,             // invoice the balance (price - retainer) automatically
+		'pay_parts'        => 1,             // split into up to 4 monthly payments
+		'pay_due_days'     => 2,             // last payment due this many days before the session
+		'pay_send_days'    => 7,             // email each invoice this many days before it is due
+		'pay_remind'       => 1,             // reminder on the due date
+		'pay_emails'       => [],            // invoice / reminder / receipt subject + body
 	];
 }
 
@@ -124,6 +131,7 @@ function jmb_install() {
 	) $c;");
 	jmb_contract_install();
 	jmb_emails_install();
+	jmb_payments_install();
 	update_option('jmb_db_ver', JMB_DB_VER);
 	if (!wp_next_scheduled('jmb_expire_holds')) wp_schedule_event(time() + 300, 'hourly', 'jmb_expire_holds');
 	if (!wp_next_scheduled('jmb_purge_old')) wp_schedule_event(time() + 600, 'daily', 'jmb_purge_old');
@@ -894,6 +902,8 @@ function jmb_rest_stripe(WP_REST_Request $req) {
 	$event = json_decode($payload, true);
 	$type  = $event['type'] ?? '';
 	$obj   = $event['data']['object'] ?? [];
+	$bal   = jmb_pay_webhook($type, $obj);
+	if ($bal !== null) return $bal;
 	$id    = (int) ($obj['metadata']['booking_id'] ?? $obj['client_reference_id'] ?? 0);
 	$t     = jmb_table();
 	$row   = $id ? $wpdb->get_row($wpdb->prepare("SELECT * FROM $t WHERE id = %d", $id), ARRAY_A) : null;
@@ -953,6 +963,7 @@ function jmb_confirm($id, $note = '', $payment_id = '', $amount_cents = null) {
 	if (!$b) return;
 	if ($b['source'] === 'web') { jmb_zap($b); jmb_gcal_push($b); }
 	jmb_mail_confirmed($b);
+	jmb_balance_create(jmb_get($id));
 }
 
 function jmb_zap($b) {
@@ -1075,6 +1086,7 @@ function jmb_purge_old() {
 	$cutoff = jmb_now()->modify("-$days days")->format('Y-m-d');
 	$n = (int) $wpdb->query($wpdb->prepare('DELETE FROM ' . jmb_table() . ' WHERE date < %s', $cutoff));
 	$wpdb->query('DELETE e FROM ' . jmb_emails_table() . ' e LEFT JOIN ' . jmb_table() . ' b ON b.id = e.booking_id WHERE b.id IS NULL');
+	$wpdb->query('DELETE p FROM ' . jmb_payments_table() . ' p LEFT JOIN ' . jmb_table() . ' b ON b.id = p.booking_id WHERE b.id IS NULL');
 	return $n;
 }
 add_action('jmb_purge_old', 'jmb_purge_old');
@@ -1125,7 +1137,8 @@ add_action('admin_post_jmb_act', function () {
 		if ($row['status'] === 'pending') jmb_release($id, $row['stripe_session']);
 		else $wpdb->update($t, ['status' => 'cancelled'], ['id' => $id]);
 		jmb_gcal_remove(jmb_get($id));
-		$msg = 'cancelled (refunds are done in Stripe)';
+		jmb_pay_void_open($id);
+		$msg = 'cancelled (open balance payments voided; refunds are done in Stripe)';
 	} elseif ($row && $do === 'gcal') {
 		$msg = 'calendar: ' . jmb_gcal_push(jmb_get($id));
 	} elseif ($row && $do === 'resend') {
@@ -1197,16 +1210,17 @@ function jmb_admin_bookings() {
 	if (!jmb_stripe_ready($s)) echo '<div class="notice notice-warning"><p>Online booking is off until the Stripe keys are saved on the <a href="' . esc_url(admin_url('admin.php?page=jmb-settings')) . '">Settings</a> page.</p></div>';
 	if (!empty($_GET['msg'])) echo '<div class="notice notice-success is-dismissible"><p>Booking ' . esc_html(wp_unslash($_GET['msg'])) . '.</p></div>';
 	echo '<p><a href="' . esc_url(admin_url('admin.php?page=jmb')) . '">Upcoming</a> | <a href="' . esc_url(admin_url('admin.php?page=jmb&show=all')) . '">All</a></p>';
-	echo '<table class="widefat striped"><thead><tr><th>#</th><th>Date</th><th>Time</th><th>Type</th><th>Status</th><th>Paid / contract</th><th>Client</th><th>Location</th><th>Sent to</th><th></th></tr></thead><tbody>';
+	echo '<table class="widefat striped"><thead><tr><th>#</th><th>Date</th><th>Time</th><th>Type</th><th>Status</th><th>Payments / contract</th><th>Client</th><th>Location</th><th>Sent to</th><th></th></tr></thead><tbody>';
 	if (!$rows) echo '<tr><td colspan="10">No bookings.</td></tr>';
 	foreach ($rows as $r) {
 		$b = jmb_get((int) $r['id']);
 		$status = esc_html($r['status'] === 'pending' ? 'paying now' : ($r['status'] === 'conflict' ? 'PAID, time taken: refund or move' : $r['status']));
 		$paid = '';
-		if ($r['payment_id']) $paid = '<a href="' . esc_url($dash . rawurlencode($r['payment_id'])) . '" target="_blank" rel="noopener">' . esc_html(jmb_money((int) $r['amount_cents'], $s)) . '</a>';
+		if ($r['payment_id']) $paid = '<a href="' . esc_url($dash . rawurlencode($r['payment_id'])) . '" target="_blank" rel="noopener">retainer ' . esc_html(jmb_money((int) $r['amount_cents'], $s)) . ' ✓</a>';
 		elseif ($r['status'] === 'confirmed' && $r['source'] === 'web') $paid = 'by hand';
 		$con = jmb_contract_for_booking((int) $r['id']);
 		if ($con) $paid .= ($paid ? '<br>' : '') . '<a href="' . esc_url(admin_url('admin.php?page=jmb-contract&id=' . (int) $con['id'])) . '">contract signed</a>';
+		if ($bal = jmb_pay_admin_cell($r)) $paid .= ($paid ? '<br>' : '') . $bal;
 		$acts = [];
 		if (in_array($r['status'], ['pending', 'expired', 'cancelled'], true) && $r['source'] === 'web')
 			$acts[] = '<a href="' . esc_url(jmb_action_url('confirm', $r['id'])) . '" onclick="return confirm(\'Mark this booking as paid (outside Stripe)?\')">Mark paid</a>';
@@ -1311,8 +1325,14 @@ add_action('admin_post_jmb_save', function () {
 	foreach (['contract_full', 'contract_mini'] as $k) $out[$k] = sanitize_textarea_field($in[$k] ?? '');
 	$out['contract_retain_years'] = isset($in['contract_retain_years']) && is_numeric($in['contract_retain_years']) ? max(0, (int) $in['contract_retain_years']) : $d['contract_retain_years'];
 	jmb_emails_save($in, $out);
+	jmb_pay_settings_save($in, $out);
 	unset($out['inbound_key'], $out['hold_hours']);   // from the Sprout-hold version
 	update_option('jmb_settings', $out);
+	if (!empty($_POST['jmb_testpay'])) {
+		$msg = jmb_pay_test(sanitize_key($_POST['jmb_testpay']), wp_get_current_user()->user_email);
+		wp_safe_redirect(admin_url('admin.php?page=jmb-settings&mail=' . rawurlencode($msg) . '#jmb-pay'));
+		exit;
+	}
 	if (!empty($_POST['jmb_testauto'])) {
 		$msg = jmb_email_test(sanitize_key($_POST['jmb_testauto']), wp_get_current_user()->user_email);
 		wp_safe_redirect(admin_url('admin.php?page=jmb-settings&mail=' . rawurlencode($msg) . '#jmb-emails'));
@@ -1438,10 +1458,10 @@ function jmb_admin_settings() {
 		. '<p class="description">They read the contract with their details filled in, tick "I agree to sign electronically" and "I have read and agree", and type their full name. The exact text, a SHA-256 fingerprint, their typed signature, time, IP address and browser are stored, and they are emailed a PDF copy once paid.</p></td></tr>';
 	echo '<tr><th>Business name</th><td>' . $f('business_name', 'text', 'class="regular-text" placeholder="' . esc_attr(wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES)) . '"') . '</td></tr>';
 	echo '<tr><th>Contract</th><td><textarea name="jmb[contract_full]" rows="16" class="large-text" placeholder="' . esc_attr($ph) . '">' . esc_textarea($s['contract_full']) . '</textarea>'
-		. '<p class="description">Plain text. A blank line starts a new paragraph; a line starting with <code>#</code> is a heading. Fill-in fields: <code>{client_name}</code> <code>{client_email}</code> <code>{client_phone}</code> <code>{session_type}</code> <code>{session_date}</code> <code>{session_time}</code> <code>{session_length}</code> <code>{location}</code> <code>{price}</code> <code>{retainer}</code> <code>{business_name}</code> <code>{today}</code>. Changing the text only affects new bookings; signed copies never change.</p></td></tr>';
+		. '<p class="description">Plain text. A blank line starts a new paragraph; a line starting with <code>#</code> is a heading. Fill-in fields: <code>{client_name}</code> <code>{client_email}</code> <code>{client_phone}</code> <code>{session_type}</code> <code>{session_date}</code> <code>{session_time}</code> <code>{session_length}</code> <code>{location}</code> <code>{price}</code> <code>{retainer}</code> <code>{balance}</code> <code>{balance_due}</code> <code>{business_name}</code> <code>{today}</code>. Changing the text only affects new bookings; signed copies never change.</p></td></tr>';
 	echo '<tr><th>Mini session contract</th><td><textarea name="jmb[contract_mini]" rows="6" class="large-text" placeholder="Leave empty to use the contract above">' . esc_textarea($s['contract_mini']) . '</textarea></td></tr>';
 	echo '<tr><th>Keep signed contracts</th><td>' . $f('contract_retain_years', 'number', 'min="0" style="width:70px"') . ' years after signing (0 = forever). Not affected by the booking clean-up.</td></tr>';
-	echo '</table>' . jmb_emails_settings_html($s) . '<h2>Weekends (golden hour)</h2><table class="form-table">';
+	echo '</table>' . jmb_pay_settings_html($s) . jmb_emails_settings_html($s) . '<h2>Weekends (golden hour)</h2><table class="form-table">';
 	echo '<tr><th>Sunset timing</th><td>The full session ends ' . $f('sunset_offset', 'number', 'step="5" style="width:80px"') . ' minutes after sunset (negative = before). Start times round down to the quarter hour.</td></tr>';
 	echo '<tr><th>Location for sunset</th><td>Latitude ' . $f('lat', 'text', 'style="width:110px"') . ' Longitude ' . $f('lon', 'text', 'style="width:110px"') . ' Time zone ' . $f('timezone', 'text', 'style="width:170px"') . '</td></tr>';
 	echo '<tr><th>Weekend limit</th><td>One booking per weekend. Once ' . $f('weekend_cap', 'number', 'min="0" style="width:70px"') . ' weekends in a month are booked, the other weekends that month close.</td></tr>';
