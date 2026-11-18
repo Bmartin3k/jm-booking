@@ -9,6 +9,7 @@ A WordPress booking calendar for a photographer, with a few rules that off-the-s
 - **Extra open times.** The photographer can open any date and time by hand, outside the rules.
 - **Pay to book.** Clients pay a retainer through Stripe Checkout (Stripe's hosted page, so no card data touches the site). A paid booking can be sent to Sprout Studio as a new lead through a Zapier webhook.
 - **Contracts with e-signature.** Before paying, the client reads the contract with their details filled in, ticks two consent boxes and types their name. The exact text, its SHA-256 fingerprint, the signature, time, IP and browser are stored, and the client is emailed a PDF copy.
+- **Automatic emails.** Prep tips before the session, a reminder with the time and place, a thank-you afterwards and a review request, each with its own timing and editable text.
 - **Google Calendar, both ways.** Anything on her calendar closes that time (on weekends, the whole day), and paid bookings are added to her calendar and removed again if cancelled.
 
 All numbers above are settings. The calendar picks up the colors of the Kadence theme automatically and falls back to a neutral look on other themes.
@@ -21,11 +22,12 @@ All numbers above are settings. The calendar picks up the colors of the Kadence 
 4. Fill in **Bookings → Settings**:
    - **Payment:** the amount charged at booking, a Stripe secret key (a restricted key with only *Checkout Sessions: Write* is enough), and a Stripe webhook pointing at the URL shown on the page, with the events `checkout.session.completed`, `checkout.session.async_payment_succeeded` and `checkout.session.expired`. Online booking stays off until both keys are saved.
    - **Contract (optional):** tick "Clients sign the contract before they pay" and paste the contract text. Plain text with `#` headings and fill-in fields such as `{client_name}`, `{session_date}`, `{location}`, `{price}` and `{retainer}` (the full list is on the settings page). A separate mini-session contract is optional.
+   - **Automatic emails (optional):** each email is off until ticked. Edit the text, then use "Save and send me a test". Emails go only to confirmed bookings, each one once; anyone who books after an email's send time skips it (the reminder still goes if the session is more than 12 hours away), and turning emails on never mails past clients.
    - **Google Calendar (optional):** create a Google Cloud project with the Google Calendar API enabled, add a service account and download its JSON key, paste the key into the settings, share the calendar with the service account's email ("Make changes to events"), and enter the calendar ID (the Gmail address for a main calendar). "Check Google Calendar" tests reading and writing.
    - **Spam protection (recommended):** Cloudflare Turnstile site and secret keys.
    - **Sprout Studio (optional):** a Zapier "Catch Hook" URL; the Zap's action is *Sprout Studio → Create Lead*.
 
-Requires WordPress 6.4+ and PHP 8.0+. WordPress needs to be able to send email for the confirmation emails.
+Requires WordPress 6.4+ and PHP 8.0+. WordPress must be able to send email: use an SMTP plugin such as WP Mail SMTP, and check it with "Send test confirmation" on the settings page. Timed tasks (automatic emails, releasing unpaid holds, clean-up) use WP-Cron, which runs when the site gets visits; on a quiet site, add a real cron job that loads `wp-cron.php` every 15 minutes. If automatic emails fail 3 times, a red banner in wp-admin says so and offers "Retry them now".
 
 ## How a booking works
 

@@ -2,17 +2,18 @@
 /**
  * Plugin Name: JM Session Booking
  * Description: Booking calendar: sunset-based weekend sessions, a cap on booked weekends per month, a discounted mini session that opens on booked days, school-year / summer weekday hours. Clients pay online with Stripe Checkout; paid bookings are sent to Sprout Studio through Zapier. Shortcode: [jm_booking]
- * Version: 2.3.1
+ * Version: 2.4.0
  * Requires PHP: 8.0
  * Requires at least: 6.4
  */
 
 if (!defined('ABSPATH')) exit;
 
-const JMB_VER    = '2.3.1';
-const JMB_DB_VER = '5';   // bump to re-run jmb_install() on update (table columns + cron events)
+const JMB_VER    = '2.4.0';
+const JMB_DB_VER = '6';   // bump to re-run jmb_install() on update (table columns + cron events)
 
 require_once __DIR__ . '/includes/contracts.php';
+require_once __DIR__ . '/includes/emails.php';
 
 /* ------------------------------------------------------------------ setup */
 
@@ -71,6 +72,8 @@ function jmb_defaults() {
 		'contract_mini'    => '',            // optional separate template for mini sessions
 		'business_name'    => '',            // shown in contracts (default: site name)
 		'contract_retain_years' => 6,        // keep signed contracts this long (0 = forever)
+		'emails'           => [],            // automatic emails: per key on/days/hour/late/subject/body (see includes/emails.php)
+		'emails_minis'     => 1,             // send them for mini sessions too
 	];
 }
 
@@ -120,12 +123,13 @@ function jmb_install() {
 		KEY token (token)
 	) $c;");
 	jmb_contract_install();
+	jmb_emails_install();
 	update_option('jmb_db_ver', JMB_DB_VER);
 	if (!wp_next_scheduled('jmb_expire_holds')) wp_schedule_event(time() + 300, 'hourly', 'jmb_expire_holds');
 	if (!wp_next_scheduled('jmb_purge_old')) wp_schedule_event(time() + 600, 'daily', 'jmb_purge_old');
 }
 register_activation_hook(__FILE__, 'jmb_install');
-register_deactivation_hook(__FILE__, function () { wp_clear_scheduled_hook('jmb_expire_holds'); wp_clear_scheduled_hook('jmb_purge_old'); });
+register_deactivation_hook(__FILE__, function () { foreach (['jmb_expire_holds', 'jmb_purge_old', 'jmb_auto_emails'] as $h) wp_clear_scheduled_hook($h); });
 add_action('plugins_loaded', function () { if (get_option('jmb_db_ver') !== JMB_DB_VER) jmb_install(); });
 
 /* ------------------------------------------------------- availability */
@@ -1069,7 +1073,9 @@ function jmb_purge_old() {
 	$days = (int) jmb_settings()['retain_days'];
 	if ($days <= 0) return 0;
 	$cutoff = jmb_now()->modify("-$days days")->format('Y-m-d');
-	return (int) $wpdb->query($wpdb->prepare('DELETE FROM ' . jmb_table() . ' WHERE date < %s', $cutoff));
+	$n = (int) $wpdb->query($wpdb->prepare('DELETE FROM ' . jmb_table() . ' WHERE date < %s', $cutoff));
+	$wpdb->query('DELETE e FROM ' . jmb_emails_table() . ' e LEFT JOIN ' . jmb_table() . ' b ON b.id = e.booking_id WHERE b.id IS NULL');
+	return $n;
 }
 add_action('jmb_purge_old', 'jmb_purge_old');
 
@@ -1212,7 +1218,7 @@ function jmb_admin_bookings() {
 		printf('<tr><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s<br><small>%s %s</small></td><td>%s</td><td><small>%s</small></td><td>%s</td></tr>',
 			$r['id'], esc_html($b['date_pretty']), esc_html($b['time_pretty']), esc_html($b['kind_label']), $status, $paid,
 			esc_html($r['name']), esc_html($r['email']), esc_html($r['phone']), esc_html($r['location']),
-			esc_html(trim($r['zap_status'] . ($r['gcal_status'] ? ' · calendar ' . $r['gcal_status'] : ''))), implode(' · ', $acts));
+			esc_html(trim($r['zap_status'] . ($r['gcal_status'] ? ' · calendar ' . $r['gcal_status'] : '') . (($es = jmb_email_summary((int) $r['id'])) ? ' · emails: ' . $es : ''), ' ·')), implode(' · ', $acts));
 	}
 	echo '</tbody></table>';
 	$s = jmb_settings();
@@ -1304,8 +1310,14 @@ add_action('admin_post_jmb_save', function () {
 	$out['business_name'] = sanitize_text_field($in['business_name'] ?? '');
 	foreach (['contract_full', 'contract_mini'] as $k) $out[$k] = sanitize_textarea_field($in[$k] ?? '');
 	$out['contract_retain_years'] = isset($in['contract_retain_years']) && is_numeric($in['contract_retain_years']) ? max(0, (int) $in['contract_retain_years']) : $d['contract_retain_years'];
+	jmb_emails_save($in, $out);
 	unset($out['inbound_key'], $out['hold_hours']);   // from the Sprout-hold version
 	update_option('jmb_settings', $out);
+	if (!empty($_POST['jmb_testauto'])) {
+		$msg = jmb_email_test(sanitize_key($_POST['jmb_testauto']), wp_get_current_user()->user_email);
+		wp_safe_redirect(admin_url('admin.php?page=jmb-settings&mail=' . rawurlencode($msg) . '#jmb-emails'));
+		exit;
+	}
 	wp_safe_redirect(admin_url('admin.php?page=jmb-settings&saved=1'));
 	exit;
 });
@@ -1400,7 +1412,7 @@ function jmb_admin_settings() {
 	$hook = rest_url('jmb/v1/stripe');
 	echo '<div class="wrap"><h1>Booking settings</h1>';
 	if (!empty($_GET['saved'])) echo '<div class="notice notice-success is-dismissible"><p>Saved.</p></div>';
-	foreach (['zap' => 'Zapier test', 'stripe' => 'Stripe test', 'gcal' => 'Google Calendar', 'mail' => 'Test confirmation'] as $q => $label)
+	foreach (['zap' => 'Zapier test', 'stripe' => 'Stripe test', 'gcal' => 'Google Calendar', 'mail' => 'Email'] as $q => $label)
 		if (!empty($_GET[$q])) echo '<div class="notice notice-info is-dismissible"><p>' . $label . ': ' . esc_html(wp_unslash($_GET[$q])) . '</p></div>';
 	echo '<p>Put <code>[jm_booking]</code> on any page to show the calendar.</p>';
 	echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '"><input type="hidden" name="action" value="jmb_save">';
@@ -1429,7 +1441,7 @@ function jmb_admin_settings() {
 		. '<p class="description">Plain text. A blank line starts a new paragraph; a line starting with <code>#</code> is a heading. Fill-in fields: <code>{client_name}</code> <code>{client_email}</code> <code>{client_phone}</code> <code>{session_type}</code> <code>{session_date}</code> <code>{session_time}</code> <code>{session_length}</code> <code>{location}</code> <code>{price}</code> <code>{retainer}</code> <code>{business_name}</code> <code>{today}</code>. Changing the text only affects new bookings; signed copies never change.</p></td></tr>';
 	echo '<tr><th>Mini session contract</th><td><textarea name="jmb[contract_mini]" rows="6" class="large-text" placeholder="Leave empty to use the contract above">' . esc_textarea($s['contract_mini']) . '</textarea></td></tr>';
 	echo '<tr><th>Keep signed contracts</th><td>' . $f('contract_retain_years', 'number', 'min="0" style="width:70px"') . ' years after signing (0 = forever). Not affected by the booking clean-up.</td></tr>';
-	echo '</table><h2>Weekends (golden hour)</h2><table class="form-table">';
+	echo '</table>' . jmb_emails_settings_html($s) . '<h2>Weekends (golden hour)</h2><table class="form-table">';
 	echo '<tr><th>Sunset timing</th><td>The full session ends ' . $f('sunset_offset', 'number', 'step="5" style="width:80px"') . ' minutes after sunset (negative = before). Start times round down to the quarter hour.</td></tr>';
 	echo '<tr><th>Location for sunset</th><td>Latitude ' . $f('lat', 'text', 'style="width:110px"') . ' Longitude ' . $f('lon', 'text', 'style="width:110px"') . ' Time zone ' . $f('timezone', 'text', 'style="width:170px"') . '</td></tr>';
 	echo '<tr><th>Weekend limit</th><td>One booking per weekend. Once ' . $f('weekend_cap', 'number', 'min="0" style="width:70px"') . ' weekends in a month are booked, the other weekends that month close.</td></tr>';
