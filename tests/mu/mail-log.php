@@ -4,6 +4,10 @@
  * option jmb_test_mail. Loaded as a must-use plugin by tests/run.sh; never install this on a real site.
  */
 add_filter('pre_wp_mail', function ($null, $atts) {
+	if (get_option('jmb_test_mail_fail')) {   // simulate a broken mail setup
+		do_action('wp_mail_failed', new WP_Error('wp_mail_failed', 'SMTP Error: Could not authenticate.'));
+		return false;
+	}
 	$log   = get_option('jmb_test_mail', []);
 	$files = [];
 	foreach ((array) $atts['attachments'] as $f) {

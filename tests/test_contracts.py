@@ -203,5 +203,31 @@ db(f"UPDATE wp_jmb_contracts SET signed_at = '2019-01-01 00:00:00' WHERE id = {r
 wpeval("do_action('jmb_purge_old');")
 check("C14b contracts older than 6 years are deleted", db(f"SELECT COUNT(*) FROM wp_jmb_contracts WHERE id={row['id']}") == [["0"]])
 
+# ------------------------------------------------- "Send me a test confirmation" button
+def testmail(to):
+    php = ("wp_set_current_user(1); $_POST = wp_slash(['to' => '%s', '_wpnonce' => wp_create_nonce('jmb_testmail')]); $_REQUEST = $_POST;"
+           "add_filter('wp_redirect', function ($l) { echo urldecode($l); exit; }); do_action('admin_post_jmb_testmail');") % to
+    return wpeval(php)
+
+before = (db("SELECT COUNT(*) FROM wp_jmb_bookings"), db("SELECT COUNT(*) FROM wp_jmb_contracts"))
+wpeval("delete_option('jmb_test_mail');")
+out = testmail("owner@example.com")
+m = mails()
+tm = m[-1] if m else {}
+tpdf = pdftotext(base64.b64decode(tm["attachments"][0]["data"])) if tm.get("attachments") else ""
+check("T1 test confirmation sent to the given address, marked [Test], with a sample contract PDF",
+      "sent to owner@example.com with a sample signed contract" in out and tm.get("to") == "owner@example.com" and tm.get("subject", "").startswith("[Test] You're booked!")
+      and "Sample Client" in " ".join(tpdf.split()) and "In a real booking" in tm.get("message", "") and "jmb_contract=" not in tm.get("message", ""), (out, tm.get("subject")))
+check("T1b nothing was booked or saved", (db("SELECT COUNT(*) FROM wp_jmb_bookings"), db("SELECT COUNT(*) FROM wp_jmb_contracts")) == before)
+check("T1c the sample uses her real settings (price, retainer, first listed location)", "$150.00" in tm.get("message", "") and "Mayfield Park" in tm.get("message", ""), tm.get("message"))
+settings(contract_on=0)
+out = testmail("owner@example.com")
+check("T2 with contracts off the test has no attachment and says so", "contracts are off" in out and not mails()[-1]["attachments"], out)
+wpeval("update_option('jmb_test_mail_fail', 1);")
+out = testmail("owner@example.com")
+wpeval("delete_option('jmb_test_mail_fail');")
+check("T3 a broken mail setup shows WordPress's actual error", "could not send it: SMTP Error: Could not authenticate." in out, out)
+check("T4 a bad address is refused", "please enter an email address" in testmail("not-an-email"))
+
 print(f"\n{ok} passed, {bad} failed")
 raise SystemExit(1 if bad else 0)

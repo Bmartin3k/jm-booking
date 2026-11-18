@@ -2,14 +2,14 @@
 /**
  * Plugin Name: JM Session Booking
  * Description: Booking calendar: sunset-based weekend sessions, a cap on booked weekends per month, a discounted mini session that opens on booked days, school-year / summer weekday hours. Clients pay online with Stripe Checkout; paid bookings are sent to Sprout Studio through Zapier. Shortcode: [jm_booking]
- * Version: 2.3.0
+ * Version: 2.3.1
  * Requires PHP: 8.0
  * Requires at least: 6.4
  */
 
 if (!defined('ABSPATH')) exit;
 
-const JMB_VER    = '2.3.0';
+const JMB_VER    = '2.3.1';
 const JMB_DB_VER = '5';   // bump to re-run jmb_install() on update (table columns + cron events)
 
 require_once __DIR__ . '/includes/contracts.php';
@@ -922,7 +922,11 @@ function jmb_rest_stripe(WP_REST_Request $req) {
 function jmb_get($id) {
 	global $wpdb;
 	$b = $wpdb->get_row($wpdb->prepare('SELECT * FROM ' . jmb_table() . ' WHERE id = %d', $id), ARRAY_A);
-	if (!$b) return null;
+	return $b ? jmb_decorate($b) : null;
+}
+
+/** Add the display fields (labels, pretty date and time) to a booking row. */
+function jmb_decorate($b) {
 	$s  = jmb_settings();
 	$tz = jmb_tz();
 	$st = new DateTimeImmutable($b['date'] . ' ' . $b['start_time'], $tz);
@@ -993,11 +997,26 @@ function jmb_mail_admin($subject, $body) {
 }
 
 function jmb_mail_confirmed($b) {
+	$s = jmb_settings();
+	$c = jmb_contract_for_booking((int) $b['id']);
+	if ($b['email']) jmb_mail_client_confirmation($b, $c, $b['email']);
+	jmb_mail_admin("New booking: {$b['name']}, {$b['date_pretty']}",
+		"{$b['kind_label']} #{$b['id']} is booked" . ($b['amount_cents'] ? ' and paid (' . jmb_money((int) $b['amount_cents'], $s) . ')' : '') . ".\n\n"
+		. "{$b['date_pretty']}, {$b['time_pretty']}\nName: {$b['name']}\nEmail: {$b['email']}\nPhone: {$b['phone']}\nLocation: {$b['location']}\nNotes: {$b['notes']}\n\n"
+		. ($c ? 'Contract signed by "' . $c['signature'] . '": ' . admin_url('admin.php?page=jmb-contract&id=' . (int) $c['id']) . "\n\n" : '')
+		. admin_url('admin.php?page=jmb'));
+}
+
+/**
+ * The "You're booked!" email the client gets, with the signed contract attached as a PDF.
+ * $test = true marks it [Test] and replaces the private contract link (a sample has none). Returns wp_mail()'s result.
+ */
+function jmb_mail_client_confirmation($b, $c, $to, $test = false) {
 	$s    = jmb_settings();
 	$site = wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES);
 	$paid = $b['amount_cents'] ? ' We received your ' . jmb_money((int) $b['amount_cents'], $s) . ' ' . strtolower($s['charge_label']) . '.' : '';
 	$where = $b['location'] && !$b['private_loc'] ? " at {$b['location']}" : '';
-	$c     = jmb_contract_for_booking((int) $b['id']);
+	$link  = $c ? ($test ? '(In a real booking, the client\'s private link to view the contract appears here.)' : jmb_contract_url($c)) : '';
 	$files = [];
 	if ($c) {
 		$dir  = trailingslashit(get_temp_dir()) . 'jmb-' . wp_generate_password(12, false);
@@ -1006,17 +1025,37 @@ function jmb_mail_confirmed($b) {
 			if (file_put_contents($file, jmb_contract_pdf($c)) !== false) $files[] = $file;
 		}
 	}
-	if ($b['email']) wp_mail($b['email'], "You're booked! {$b['kind_label']} – {$b['date_pretty']}",
+	$sent = wp_mail($to, ($test ? '[Test] ' : '') . "You're booked! {$b['kind_label']} – {$b['date_pretty']}",
 		"Hi {$b['name']},\n\nYour {$b['kind_label']} on {$b['date_pretty']}, {$b['time_pretty']}$where is confirmed.$paid\n\n"
 		. ($b['private_loc'] ? "We'll send you the exact location before your session.\n\n" : '')
-		. ($c ? "Your signed contract is attached as a PDF. You can also view it any time here (keep this link private):\n" . jmb_contract_url($c) . "\n\n" : '')
+		. ($c ? "Your signed contract is attached as a PDF. You can also view it any time here (keep this link private):\n" . $link . "\n\n" : '')
 		. "We'll be in touch with the details. See you then!\n\n$site", '', $files);
 	foreach ($files as $f) { @unlink($f); @rmdir(dirname($f)); }
-	jmb_mail_admin("New booking: {$b['name']}, {$b['date_pretty']}",
-		"{$b['kind_label']} #{$b['id']} is booked" . ($b['amount_cents'] ? ' and paid (' . jmb_money((int) $b['amount_cents'], $s) . ')' : '') . ".\n\n"
-		. "{$b['date_pretty']}, {$b['time_pretty']}\nName: {$b['name']}\nEmail: {$b['email']}\nPhone: {$b['phone']}\nLocation: {$b['location']}\nNotes: {$b['notes']}\n\n"
-		. ($c ? 'Contract signed by "' . $c['signature'] . '": ' . admin_url('admin.php?page=jmb-contract&id=' . (int) $c['id']) . "\n\n" : '')
-		. admin_url('admin.php?page=jmb'));
+	return $sent;
+}
+
+/** A realistic booking + signed contract that is never saved, for the "Send me a test confirmation" button. */
+function jmb_sample_booking($to) {
+	$s     = jmb_settings();
+	$day   = jmb_now()->modify('+' . max(1, (int) $s['min_notice_days']) . ' days')->modify('next saturday');
+	$locs  = jmb_locations($s);
+	$b = jmb_decorate([
+		'id' => 1234, 'kind' => 'full', 'date' => $day->format('Y-m-d'), 'start_time' => '15:30', 'end_time' => '17:30',
+		'status' => 'confirmed', 'name' => 'Sample Client', 'email' => $to, 'phone' => '512-555-0100',
+		'location' => $locs ? $locs[0]['items'][0] : 'Mayfield Park', 'notes' => '',
+		'amount_cents' => jmb_charge_cents('full', $s) ?: 15000, 'source' => 'web', 'payment_id' => '', 'gcal_event' => '',
+	]);
+	$c = null;
+	if (jmb_contract_enabled($s)) {
+		$render = jmb_contract_render(jmb_contract_data_for('full', $b['date'], '15:30', $b['name'], $to, $b['phone'], $b['location'], $s), $s);
+		$c = [
+			'id' => 0, 'booking_id' => 1234, 'token' => '', 'kind' => 'full', 'title' => $render[0], 'body' => $render[1], 'body_hash' => $render[3],
+			'signer_name' => 'Sample Client', 'signature' => 'Sample Client', 'signer_email' => $to,
+			'consent' => wp_json_encode(array_values(jmb_contract_consents())), 'signed_at' => jmb_utc_now(),
+			'ip' => jmb_client_ip(), 'user_agent' => sanitize_text_field($_SERVER['HTTP_USER_AGENT'] ?? 'test'),
+		];
+	}
+	return [$b, $c];
 }
 
 add_action('jmb_expire_holds', function () {
@@ -1306,6 +1345,25 @@ add_action('admin_post_jmb_testgcal', function () {
 	exit;
 });
 
+add_action('admin_post_jmb_testmail', function () {
+	if (!current_user_can('manage_options')) wp_die('No.');
+	check_admin_referer('jmb_testmail');
+	$to = sanitize_email(wp_unslash($_POST['to'] ?? ''));
+	if (!is_email($to)) $msg = 'please enter an email address to send the test to';
+	else {
+		$why = '';
+		$catch = function ($err) use (&$why) { $why = $err->get_error_message(); };
+		add_action('wp_mail_failed', $catch);
+		[$b, $c] = jmb_sample_booking($to);
+		$ok = jmb_mail_client_confirmation($b, $c, $to, true);
+		remove_action('wp_mail_failed', $catch);
+		$msg = $ok ? "sent to $to" . ($c ? ' with a sample signed contract attached' : ' (no contract attached: contracts are off)') . '. Check the inbox (and the spam folder).'
+			: 'WordPress could not send it' . ($why ? ": $why" : '') . '. Check the WP Mail SMTP settings.';
+	}
+	wp_safe_redirect(admin_url('admin.php?page=jmb-settings&mail=' . rawurlencode($msg)));
+	exit;
+});
+
 add_action('admin_post_jmb_testzap', function () {
 	if (!current_user_can('manage_options')) wp_die('No.');
 	check_admin_referer('jmb_testzap');
@@ -1342,7 +1400,7 @@ function jmb_admin_settings() {
 	$hook = rest_url('jmb/v1/stripe');
 	echo '<div class="wrap"><h1>Booking settings</h1>';
 	if (!empty($_GET['saved'])) echo '<div class="notice notice-success is-dismissible"><p>Saved.</p></div>';
-	foreach (['zap' => 'Zapier test', 'stripe' => 'Stripe test', 'gcal' => 'Google Calendar'] as $q => $label)
+	foreach (['zap' => 'Zapier test', 'stripe' => 'Stripe test', 'gcal' => 'Google Calendar', 'mail' => 'Test confirmation'] as $q => $label)
 		if (!empty($_GET[$q])) echo '<div class="notice notice-info is-dismissible"><p>' . $label . ': ' . esc_html(wp_unslash($_GET[$q])) . '</p></div>';
 	echo '<p>Put <code>[jm_booking]</code> on any page to show the calendar.</p>';
 	echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '"><input type="hidden" name="action" value="jmb_save">';
@@ -1405,6 +1463,12 @@ function jmb_admin_settings() {
 	echo '</table>';
 	submit_button('Save settings');
 	echo '</form>';
+	$me = wp_get_current_user();
+	echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '" style="margin:1em 0"><input type="hidden" name="action" value="jmb_testmail">';
+	wp_nonce_field('jmb_testmail');
+	echo '<label>Send me a test confirmation at <input type="email" name="to" class="regular-text" value="' . esc_attr($me->user_email) . '"></label> ';
+	submit_button('Send test confirmation', 'secondary', 'submit', false);
+	echo '<p class="description">The email a client gets after paying, with a sample signed contract attached when contracts are on. Nothing is booked.</p></form>';
 	foreach (['jmb_teststripe' => 'Check the Stripe key', 'jmb_testgcal' => 'Check Google Calendar', 'jmb_testzap' => 'Send a test booking to Zapier'] as $act => $label) {
 		echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '" style="display:inline-block;margin-right:8px"><input type="hidden" name="action" value="' . $act . '">';
 		wp_nonce_field($act);
