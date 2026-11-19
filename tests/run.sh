@@ -9,7 +9,7 @@ ROOT=$(cd .. && pwd)
 TESTS=$(pwd)
 
 cleanup() {
-  docker rm -f jmbtest-wp jmbtest-db stripe-mock >/dev/null 2>&1 || true
+  docker rm -f -v jmbtest-wp jmbtest-db stripe-mock >/dev/null 2>&1 || true   # -v also drops their anonymous volumes (WP files + DB)
   docker network rm jmbtest >/dev/null 2>&1 || true
 }
 [ "${KEEP:-}" = 1 ] || trap cleanup EXIT   # KEEP=1 leaves the test site running for debugging
